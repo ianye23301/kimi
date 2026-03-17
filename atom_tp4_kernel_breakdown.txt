@@ -1,0 +1,128 @@
+Total GPU kernel time: 46.0 ms
+
+[ 1]  13.3%  calls=  488  total=    6.13ms  avg=    12.6us
+     AITER bf16 GEMV 32x64 splitk
+     params: bf16→fp32→bf16
+
+[ 2]  10.8%  calls=  480  total=    4.97ms  avg=    10.4us
+     hipBLASLt GEMM
+     params: tile=32x16x128, splitK=3, ISA=950, WS=64, WG=16_4_4
+
+[ 3]   8.8%  calls=  244  total=    4.02ms  avg=    16.5us
+     MLA Decode (a8w8)
+     params: qheads=16, seqlen=1, gqa_ratio=16
+
+[ 4]   7.2%  calls=  488  total=    3.29ms  avg=     6.7us
+     AllReduce (reduce_scatter)
+     params: dtype=bfloat16_t, ranks=4
+
+[ 5]   7.0%  calls=  240  total=    3.24ms  avg=    13.5us
+     MoE CK Flatmm gate+up (stage1)
+     params: tile=<16, 128, 256>, MXFP4→bf16, scale=e8m0/group32
+
+[ 6]   5.0%  calls=  240  total=    2.30ms  avg=     9.6us
+     MoE Sorting (topk route)
+     params: int/float, sorted
+
+[ 7]   4.7%  calls=  488  total=    2.16ms  avg=     4.4us
+     Fused Load+RMSNorm+AllReduce
+     params: dtype=bfloat16_t, hidden=512
+
+[ 8]   4.6%  calls=  244  total=    2.10ms  avg=     8.6us
+     AITER bf16 GEMV 64x64 splitk
+     params: bf16→fp32→bf16
+
+[ 9]   4.3%  calls=  484  total=    1.96ms  avg=     4.0us
+     SiLU Activation (act_and_mul)
+     params: bf16
+
+[10]   4.2%  calls=  240  total=    1.95ms  avg=     8.1us
+     MoE Weighted Sum (wv_splitk)
+     params: __hip_bfloat16, 64, 1, 1, 8, 4, 1
+
+[11]   3.9%  calls=  244  total=    1.81ms  avg=     7.4us
+     MLA Reduce
+     params: block=512, heads=16, splits=1
+
+[12]   3.8%  calls=  240  total=    1.74ms  avg=     7.2us
+     MoE CK Flatmm down (stage2)
+     params: tile=<16, 128, 256>, MXFP4→bf16, scale=e8m0/group32
+
+[13]   3.8%  calls=  240  total=    1.72ms  avg=     7.2us
+     MoE Grouped TopK
+     params: c10::BFloat16, float __vector(4), 1, true, true, false
+
+[14]   3.0%  calls=  244  total=    1.40ms  avg=     5.7us
+     MLA Batched GEMM (a8w8)
+     params: M=16, N=32, K=128, grid=4
+
+[15]   2.3%  calls=  244  total=    1.06ms  avg=     4.3us
+     MLA Batched GEMM (a8w8)
+     params: M=16, N=128, K=128, grid=4
+
+[16]   2.2%  calls=  244  total=    1.02ms  avg=     4.2us
+     Fused Add+RMSNorm+Quant
+     params: hidden=256
+
+[17]   2.2%  calls=  240  total=    0.99ms  avg=     4.1us
+     Triton Fused Add+AllReduce+RMSNorm
+
+[18]   2.1%  calls=  244  total=    0.98ms  avg=     4.0us
+     Fused Add+RMSNorm+Quant
+     params: hidden=64
+
+[19]   2.1%  calls=  244  total=    0.97ms  avg=     4.0us
+     Fused RoPE+KV Cache Store
+     params: bf16→fp8
+
+[20]   2.1%  calls=  240  total=    0.95ms  avg=     4.0us
+     Fill (zeros)
+     params: bf16
+
+[21]   1.0%  calls=    5  total=    0.46ms  avg=    92.7us
+     hipBLASLt GEMM
+     params: tile=256x16x128, splitK=3, ISA=950, WS=64, WG=64_4_1
+
+[22]   0.5%  calls=    5  total=    0.22ms  avg=    43.8us
+     Sampling (mix_sample)
+     params: vocab=1024
+
+[23]   0.3%  calls=    8  total=    0.15ms  avg=    19.0us
+     hipBLASLt GEMM
+     params: tile=256x16x64, splitK=3, ISA=950, WS=64, WG=64_4_1
+
+[24]   0.3%  calls=    4  total=    0.12ms  avg=    30.7us
+     MLA Metadata
+     params: page_size=128
+
+[25]   0.1%  calls=    5  total=    0.06ms  avg=    12.5us
+     NCCL Collective
+
+[26]   0.1%  calls=    4  total=    0.04ms  avg=     9.2us
+     AllReduce (cross_device_reduce)
+
+[27]   0.1%  calls=    5  total=    0.04ms  avg=     7.1us
+     AllGather
+     params: dtype=bfloat16_t
+
+[28]   0.1%  calls=    4  total=    0.03ms  avg=     6.8us
+     hipBLASLt GEMM (PostGSU16)
+     params: tile=?
+
+[29]   0.0%  calls=    4  total=    0.02ms  avg=     4.6us
+     Masked Embedding
+
+[30]   0.0%  calls=    4  total=    0.02ms  avg=     4.1us
+     KV Indices Generate
+
+[31]   0.0%  calls=    4  total=    0.02ms  avg=     4.0us
+     hipBLASLt GEMM (PostGSU8)
+     params: tile=?
+
+[32]   0.0%  calls=    4  total=    0.02ms  avg=     4.0us
+     Fused Add+RMSNorm+Quant
+     params: hidden=256
+
+[33]   0.0%  calls=    4  total=    0.01ms  avg=     3.2us
+     HIP copyBuffer
+
