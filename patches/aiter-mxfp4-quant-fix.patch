@@ -1,0 +1,22 @@
+diff --git a/aiter/ops/triton/quant/fused_mxfp4_quant.py b/aiter/ops/triton/quant/fused_mxfp4_quant.py
+index 1a9736c76..14e153ca0 100644
+--- a/aiter/ops/triton/quant/fused_mxfp4_quant.py
++++ b/aiter/ops/triton/quant/fused_mxfp4_quant.py
+@@ -163,13 +163,16 @@ def mxfp4_quant_shuffled(
+     Returns:
+         (x_fp4, x_scale): quantized data and e8m0 block scales
+     """
++    MXFP4_QUANT_BLOCK_SIZE = 32
++    # Match _fuse_rmsnorm_fp4_quant behavior: skip shuffle for small M
++    shuffle_bool = shuffle and (x.shape[0] >= MXFP4_QUANT_BLOCK_SIZE)
+     # Pass x[0] as dummy weight ptr (never accessed when skip_rmsnorm=True).
+     # Avoids tensor allocation which would break CUDAGraph capture.
+     (x_fp4, x_scale), _, _, _ = fused_rms_mxfp4_quant(
+         x1=x,
+         x1_weight=x[0],
+         x1_epsilon=0.0,
+-        shuffle=shuffle,
++        shuffle=shuffle_bool,
+         scale_shuffle_padding=scale_shuffle_padding,
+         skip_rmsnorm=True,
+     )

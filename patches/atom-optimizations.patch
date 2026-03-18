@@ -1,7 +1,7 @@
 From 5ea513c815d1738e03297afb6b2fbb0e740b9f5c Mon Sep 17 00:00:00 2001
 From: Ian <ian@wafer.ai>
 Date: Wed, 18 Mar 2026 06:56:12 +0000
-Subject: [PATCH 1/4] Add files
+Subject: [PATCH 1/5] Add files
 
 ---
  atom/config.py                    |  20 +++-
@@ -411,7 +411,7 @@ index d1da9f0..f4d36a4 100644
 From ed330fe16245529afe65c22e86a7f99d27734ea8 Mon Sep 17 00:00:00 2001
 From: Ian <ian@wafer.ai>
 Date: Wed, 18 Mar 2026 07:02:50 +0000
-Subject: [PATCH 2/4] fix: decide Q dtype at allocation time based on batch
+Subject: [PATCH 2/5] fix: decide Q dtype at allocation time based on batch
  size
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -468,7 +468,7 @@ index 055c5f0..e308fb2 100644
 From 3d414b40ce6ef13deb94f7735e6e09e1a86ec1bf Mon Sep 17 00:00:00 2001
 From: Ian <ian@wafer.ai>
 Date: Wed, 18 Mar 2026 07:20:49 +0000
-Subject: [PATCH 3/4] feat: fuse k_up_proj BMM + RoPE + KV cache into single
+Subject: [PATCH 3/5] feat: fuse k_up_proj BMM + RoPE + KV cache into single
  kernel
 
 Enable fused_kv_bmm path that combines the k_up_proj FP4 BMM,
@@ -642,7 +642,7 @@ index e308fb2..f6ca894 100644
 From d000e413f975ce48f2bdd50e95edb6a644f9256a Mon Sep 17 00:00:00 2001
 From: Ian <ian@wafer.ai>
 Date: Wed, 18 Mar 2026 07:22:36 +0000
-Subject: [PATCH 4/4] perf: pre-allocate constant tensors in MLA (empty k_pe,
+Subject: [PATCH 4/5] perf: pre-allocate constant tensors in MLA (empty k_pe,
  one_scale on GPU)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -698,6 +698,53 @@ index f6ca894..2b4574e 100644
              kv_lora_rank=self.kv_lora_rank,
              rotary_dim=0,
              cos_sin_cache=None,
+-- 
+2.43.0
+
+
+From 35b6a1314081b54a089ac8750e282c464196c2ef Mon Sep 17 00:00:00 2001
+From: Ian <ian@wafer.ai>
+Date: Wed, 18 Mar 2026 08:21:15 +0000
+Subject: [PATCH 5/5] refactor: remove redundant kv_buffer view in MLA decode
+
+- Reuse k_buffer for v_buffer slice instead of creating second view
+- Remove unnecessary unsqueeze(2) in ASM decode path; use view directly
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ atom/model_ops/attention_mla.py | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/atom/model_ops/attention_mla.py b/atom/model_ops/attention_mla.py
+index 2b4574e..a779b96 100644
+--- a/atom/model_ops/attention_mla.py
++++ b/atom/model_ops/attention_mla.py
+@@ -574,7 +574,7 @@ class MLAAttention(nn.Module):
+         # V is just the kv_lora_rank portion — same storage, narrowed view.
+         # Not contiguous (stride[0]=576 != 512) but the Triton kernel only
+         # accesses offs_c < kv_lora_rank via stride_buf_vbs, so this is fine.
+-        v_buffer = kv_c_and_k_pe_cache.view(-1, 1, dim)[:, :, : self.kv_lora_rank]
++        v_buffer = k_buffer[:, :, : self.kv_lora_rank]
+ 
+         paged_kv_indptr = attn_metadata.kv_indptr
+         paged_kv_indices = attn_metadata.kv_indices
+@@ -681,7 +681,6 @@ class MLAAttention(nn.Module):
+                 device=q.device,
+             )
+ 
+-        kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
+         paged_kv_indptr = attn_metadata.kv_indptr
+         paged_kv_indices = attn_metadata.kv_indices
+         if self.topk_indices_buffer is not None:
+@@ -721,7 +720,7 @@ class MLAAttention(nn.Module):
+ 
+         mla_decode_fwd(
+             q,
+-            kv_buffer.view(-1, 1, 1, q.shape[-1]),
++            kv_c_and_k_pe_cache.view(-1, 1, 1, q.shape[-1]),
+             o,
+             attn_metadata.cu_seqlens_q,
+             paged_kv_indptr,
 -- 
 2.43.0
 
