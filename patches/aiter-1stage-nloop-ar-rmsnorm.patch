@@ -1,0 +1,256 @@
+diff --git a/csrc/include/custom_all_reduce.cuh b/csrc/include/custom_all_reduce.cuh
+index 972e5ffe4..69e9d3d0d 100644
+--- a/csrc/include/custom_all_reduce.cuh
++++ b/csrc/include/custom_all_reduce.cuh
+@@ -1533,6 +1533,213 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
+         acc, weight_p, hidden_dim, eps, idx, tidx, output, scale_out);
+ }
+ 
++// 1-stage fused AR+RMSNorm for hidden dims that exceed max threads per block.
++// Uses N_LOOP iterations per thread to cover the full hidden dim.
++// BLOCK_SIZE * PACK_SIZE * N_LOOP >= HIDDEN_DIM (some threads may be idle in the last iter).
++template <typename T, typename OutT, int ngpus, int BLOCK_SIZE, int N_LOOP, int HIDDEN_DIM>
++__global__ void __launch_bounds__(BLOCK_SIZE, 1)
++    allreduce_fusion_kernel_1stage_nloop(RankData* _dp,
++                                         RankSignals sg,
++                                         Signal* self_sg,
++                                         int rank,
++                                         T* __restrict__ residual_inp,
++                                         T* __restrict__ residual_out,
++                                         OutT* __restrict__ output,
++                                         T* __restrict__ weight,
++                                         float* __restrict__ scale_out,
++                                         int size,
++                                         float eps)
++{
++    constexpr int pack_size   = 16 / sizeof(T);
++    constexpr int packs_total = HIDDEN_DIM / pack_size; // 896 for n=7168, bf16
++    using P                   = typename opus::vector_t<T, pack_size>;
++    using A                   = typename opus::vector_t<opus::fp32_t, pack_size>;
++    int tidx                  = blockIdx.x; // token index
++    int token_offset          = tidx * HIDDEN_DIM;
++
++    const P* ptrs[ngpus];
++#pragma unroll
++    for(int i = 0; i < ngpus; ++i)
++    {
++        ptrs[i] = (const P*)_dp->ptrs[i];
++    }
++    start_sync<ngpus>(sg, self_sg, rank);
++
++    // Phase 1: AllReduce + residual add, accumulate square_sum for RMSNorm
++    A acc_arr[N_LOOP];
++    P weight_arr[N_LOOP];
++    float square_sum = 0.0f;
++
++#pragma unroll
++    for(int n_iter = 0; n_iter < N_LOOP; ++n_iter)
++    {
++        int pack_idx = n_iter * BLOCK_SIZE + threadIdx.x;
++        if(pack_idx < packs_total)
++        {
++            int elem_idx = token_offset + pack_idx * pack_size;
++
++            // Sum across all GPUs
++            A acc;
++            P vec = ptrs[0][elem_idx / pack_size];
++#pragma unroll
++            for(int v = 0; v < pack_size; ++v)
++                acc[v] = upcast_s(vec[v]);
++#pragma unroll
++            for(int r = 1; r < ngpus; ++r)
++            {
++                vec = ptrs[r][elem_idx / pack_size];
++#pragma unroll
++                for(int v = 0; v < pack_size; ++v)
++                    acc[v] += upcast_s(vec[v]);
++            }
++
++            // Add residual
++            P res = *reinterpret_cast<P*>(residual_inp + elem_idx);
++#pragma unroll
++            for(int v = 0; v < pack_size; ++v)
++                acc[v] += upcast_s(res[v]);
++
++            // Write residual output
++            P res_out;
++#pragma unroll
++            for(int v = 0; v < pack_size; ++v)
++                res_out[v] = downcast_s<T>(acc[v]);
++            *reinterpret_cast<P*>(residual_out + elem_idx) = res_out;
++
++            // Load weight
++            weight_arr[n_iter] = *reinterpret_cast<P*>(weight + pack_idx * pack_size);
++
++            // Accumulate square sum
++#pragma unroll
++            for(int v = 0; v < pack_size; ++v)
++                square_sum += acc[v] * acc[v];
++
++            acc_arr[n_iter] = acc;
++        }
++        else
++        {
++            // Zero out for threads beyond packs_total
++#pragma unroll
++            for(int v = 0; v < pack_size; ++v)
++                acc_arr[n_iter][v] = 0.0f;
++        }
++    }
++
++    // Phase 2: Block-level reduction for RMSNorm denominator
++    square_sum = ar_fusion_epilogue_block_reduce<AddFunctor, float, BLOCK_SIZE, 32>(square_sum);
++    __shared__ float s_denom;
++    if(threadIdx.x == 0)
++    {
++        s_denom = rsqrtf(square_sum / HIDDEN_DIM + eps);
++    }
++    __syncthreads();
++    float denom = s_denom;
++
++    // Phase 3: Apply RMSNorm and write output
++    if constexpr(std::is_same_v<T, OutT>)
++    {
++        // bf16 output path
++#pragma unroll
++        for(int n_iter = 0; n_iter < N_LOOP; ++n_iter)
++        {
++            int pack_idx = n_iter * BLOCK_SIZE + threadIdx.x;
++            if(pack_idx < packs_total)
++            {
++                int elem_idx = token_offset + pack_idx * pack_size;
++                P result;
++#pragma unroll
++                for(int v = 0; v < pack_size; ++v)
++                {
++                    result[v] = downcast_s<T>(acc_arr[n_iter][v] * upcast_s(weight_arr[n_iter][v]) * denom);
++                }
++                *reinterpret_cast<P*>(output + elem_idx) = result;
++            }
++        }
++    }
++    else
++    {
++        // FP8 output path: need global abs_max across all elements
++        float local_amax = -1.f;
++#pragma unroll
++        for(int n_iter = 0; n_iter < N_LOOP; ++n_iter)
++        {
++            int pack_idx = n_iter * BLOCK_SIZE + threadIdx.x;
++            if(pack_idx < packs_total)
++            {
++#pragma unroll
++                for(int v = 0; v < pack_size; ++v)
++                {
++                    float val = acc_arr[n_iter][v] * upcast_s(weight_arr[n_iter][v]) * denom;
++                    float abs_val = val > 0.f ? val : -val;
++                    local_amax = local_amax > abs_val ? local_amax : abs_val;
++                }
++            }
++        }
++        local_amax = ar_fusion_epilogue_block_reduce<MaxFunctor, float, BLOCK_SIZE, 32>(local_amax);
++        __shared__ float s_amax;
++        if(threadIdx.x == 0)
++            s_amax = local_amax;
++        __syncthreads();
++
++        float FP8_UPBOUND = opus::cast<opus::fp32_t>(opus::numeric_limits<opus::fp8_t>::max());
++        float amax  = s_amax;
++        float scale = amax == 0.f ? 1.f : amax / FP8_UPBOUND;
++
++        using OP = opus::vector_t<OutT, pack_size>;
++#pragma unroll
++        for(int n_iter = 0; n_iter < N_LOOP; ++n_iter)
++        {
++            int pack_idx = n_iter * BLOCK_SIZE + threadIdx.x;
++            if(pack_idx < packs_total)
++            {
++                int elem_idx = token_offset + pack_idx * pack_size;
++                A normed;
++#pragma unroll
++                for(int v = 0; v < pack_size; ++v)
++                    normed[v] = acc_arr[n_iter][v] * upcast_s(weight_arr[n_iter][v]) * denom;
++                OP quant_result = packQuant<opus::fp32_t, pack_size>(normed, scale);
++                *reinterpret_cast<OP*>(output + elem_idx) = quant_result;
++            }
++        }
++        if(threadIdx.x == 0 && scale_out != nullptr)
++            scale_out[tidx] = scale;
++    }
++}
++
++template <typename T, typename OutT, int NGPUS, int HIDDEN_DIM, int BLOCK_SIZE, int N_LOOP>
++void allreduce_fusion_kernel_1stage_nloop_launcher(RankData* _dp,
++                                                    RankSignals sg,
++                                                    Signal* self_sg,
++                                                    int rank,
++                                                    T* residual_inp,
++                                                    T* residual_out,
++                                                    OutT* output,
++                                                    T* weight,
++                                                    float* scale_out,
++                                                    int size,
++                                                    float eps,
++                                                    hipStream_t stream)
++{
++    int token_num = size / HIDDEN_DIM;
++    if(token_num > kMaxBlocks)
++        throw std::runtime_error(
++            "Token number is too large for allreduce_fusion_kernel_1stage_nloop kernel");
++    dim3 threadsPerBlock(BLOCK_SIZE);
++    dim3 numBlocks(token_num);
++    allreduce_fusion_kernel_1stage_nloop<T, OutT, NGPUS, BLOCK_SIZE, N_LOOP, HIDDEN_DIM>
++        <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
++                                                    sg,
++                                                    self_sg,
++                                                    rank,
++                                                    residual_inp,
++                                                    residual_out,
++                                                    output,
++                                                    weight,
++                                                    scale_out,
++                                                    size,
++                                                    eps);
++}
++
+ template <typename T, typename OutT, int NGPUS, int HIDDEN_DIM>
+ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
+                                              RankSignals sg,
+@@ -2481,7 +2688,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
+     hipGetDeviceProperties(&dev_prop, dev);
+     uint32_t num_cu = dev_prop.multiProcessorCount;
+ 
+-    use_1stage = (use_1stage && (n == 4096 || n == 2048 || n == 1024 || n == 512));
++    use_1stage = (use_1stage && (n == 7168 || n == 4096 || n == 2048 || n == 1024 || n == 512));
+ #define DISPATCH_1S_KERNEL(NGPUS, N)                                          \
+     case N: {                                                                 \
+         allreduce_fusion_kernel_1stage_launcher<T, T, NGPUS, N>(ptrs,         \
+@@ -2498,11 +2705,20 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
+                                                                 stream);      \
+         return;                                                               \
+     }
++#define DISPATCH_1S_NLOOP_KERNEL(NGPUS, HIDDEN, BSIZE, NLOOP)                             \
++    case HIDDEN: {                                                                        \
++        allreduce_fusion_kernel_1stage_nloop_launcher<T, T, NGPUS, HIDDEN, BSIZE, NLOOP>( \
++            ptrs, sg_, self_sg_, rank_,                                                   \
++            residual_inp, residual_out, output, weight, nullptr,                          \
++            size, eps, stream);                                                           \
++        return;                                                                           \
++    }
+ #define MAYBE_DISPATCH_1S_KERNEL(NGPUS)                                  \
+     if(use_1stage)                                                       \
+     {                                                                    \
+         switch(n)                                                        \
+         {                                                                \
++            DISPATCH_1S_NLOOP_KERNEL(NGPUS, 7168, 512, 2)               \
+             DISPATCH_1S_KERNEL(NGPUS, 4096)                              \
+             DISPATCH_1S_KERNEL(NGPUS, 2048)                              \
+             DISPATCH_1S_KERNEL(NGPUS, 1024)                              \
+@@ -2536,6 +2752,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
+     }
+ 
+ #undef MAYBE_DISPATCH_1S_KERNEL
++#undef DISPATCH_1S_NLOOP_KERNEL
+ 
+     // step 2, run allgather local device load + rmsnorm
+     int n_bytes  = n * sizeof(T);
