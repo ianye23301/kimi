@@ -1,0 +1,466 @@
+From 5ea513c815d1738e03297afb6b2fbb0e740b9f5c Mon Sep 17 00:00:00 2001
+From: Ian <ian@wafer.ai>
+Date: Wed, 18 Mar 2026 06:56:12 +0000
+Subject: [PATCH 1/2] Add files
+
+---
+ atom/config.py                    |  20 +++-
+ atom/model_engine/model_runner.py |   1 +
+ atom/model_loader/loader.py       |   6 ++
+ atom/model_ops/attention_mla.py   | 173 +++++++++++++++++++++++++++---
+ atom/models/deepseek_v2.py        |  45 ++++++--
+ 5 files changed, 221 insertions(+), 24 deletions(-)
+
+diff --git a/atom/config.py b/atom/config.py
+index 1d43398..1a10bd7 100644
+--- a/atom/config.py
++++ b/atom/config.py
+@@ -574,7 +574,7 @@ _CONFIG_REGISTRY: dict[str, str] = {
+ }
+ 
+ 
+-def get_hf_config(model: str) -> PretrainedConfig:
++def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
+     config_dict, _ = PretrainedConfig.get_config_dict(
+         model,
+     )
+@@ -594,7 +594,21 @@ def get_hf_config(model: str) -> PretrainedConfig:
+             # code_revision=code_revision,
+             token=_get_hf_token(),
+         )
+-    return AutoConfig.from_pretrained(model)
++    config = AutoConfig.from_pretrained(model, trust_remote_code=trust_remote_code)
++
++    # For multimodal wrapper models (e.g. Kimi-K2.5), extract the text backbone
++    # config so ATOM can use the underlying architecture directly.
++    text_config = getattr(config, "text_config", None)
++    if text_config is not None and hasattr(text_config, "architectures"):
++        # Carry over quantization_config from the wrapper if the text
++        # backbone doesn't have its own.
++        if not hasattr(text_config, "quantization_config") and hasattr(
++            config, "quantization_config"
++        ):
++            text_config.quantization_config = config.quantization_config
++        return text_config
++
++    return config
+ 
+ 
+ def get_generation_config(model: str) -> GenerationConfig:
+@@ -817,7 +831,7 @@ class Config:
+         # assert os.path.isdir(self.model)
+ 
+         assert 1 <= self.tensor_parallel_size <= 8
+-        self.hf_config = get_hf_config(self.model)
++        self.hf_config = get_hf_config(self.model, self.trust_remote_code)
+         if not hasattr(self.hf_config, "rope_parameters"):
+             # Compatible with both transformers < 5
+             rope_params = getattr(self.hf_config, "rope_scaling", {})
+diff --git a/atom/model_engine/model_runner.py b/atom/model_engine/model_runner.py
+index 771c15e..fc1a0c8 100644
+--- a/atom/model_engine/model_runner.py
++++ b/atom/model_engine/model_runner.py
+@@ -607,6 +607,7 @@ class ModelRunner:
+             "deepseek_v32",
+             "deepseek_mtp",
+             "glm_moe_dsa",
++            "kimi_k2",
+         ):
+             return self.hf_text_config.kv_lora_rank is not None
+         elif self.hf_text_config.model_type == "eagle":
+diff --git a/atom/model_loader/loader.py b/atom/model_loader/loader.py
+index b9e4424..11d9c9a 100644
+--- a/atom/model_loader/loader.py
++++ b/atom/model_loader/loader.py
+@@ -189,6 +189,12 @@ def load_model(
+         ):
+             if load_dummy:
+                 continue
++            # For multimodal wrapper models (e.g. Kimi-K2.5), skip
++            # vision/projector weights and strip the language_model prefix.
++            if name.startswith(("vision_tower.", "mm_projector.")):
++                continue
++            if name.startswith("language_model."):
++                name = name[len("language_model."):]
+             if name.endswith("kv_scale") or "inv_freq" in name:
+                 continue
+             if spec_decode:
+diff --git a/atom/model_ops/attention_mla.py b/atom/model_ops/attention_mla.py
+index 4db829e..055c5f0 100644
+--- a/atom/model_ops/attention_mla.py
++++ b/atom/model_ops/attention_mla.py
+@@ -2,6 +2,7 @@
+ # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+ 
+ import logging
++import os
+ from dataclasses import dataclass
+ from functools import partial as functools_partial
+ from typing import Optional
+@@ -19,6 +20,7 @@ from aiter import (
+ )
+ from aiter.dist.parallel_state import get_dp_group
+ from aiter.mla import mla_decode_fwd, mla_prefill_fwd
++from aiter.ops.triton.attention.mla_decode_rope import decode_attention_fwd_grouped_rope
+ from atom.config import get_current_atom_config
+ from atom.model_ops.linear import use_triton_gemm
+ from atom.model_ops.utils import get_and_maybe_dequant_weights
+@@ -133,7 +135,18 @@ class MLAAttention(nn.Module):
+ 
+         self.padded_num_heads = max(num_heads, _MLA_MIN_HEADS)
+         self.head_repeat_factor = self.padded_num_heads // num_heads
+-        if self.head_repeat_factor > 1:
++        # Use Triton MLA decode for sub-16 head counts to avoid head padding overhead.
++        # The ASM kernel requires >=16 heads, forcing repeat+float8_copy+wasted compute.
++        # Triton kernel handles arbitrary head counts natively.
++        self.use_triton_mla_decode = (
++            self.head_repeat_factor > 1
++            and os.environ.get("ATOM_MLA_TRITON_DECODE", "1") == "1"
++        )
++        if self.use_triton_mla_decode:
++            logger.info(
++                f"MLA Triton decode enabled: {num_heads} heads (no padding needed)"
++            )
++        if self.head_repeat_factor > 1 and not self.use_triton_mla_decode:
+             assert self.padded_num_heads % num_heads == 0, (
+                 f"Padded head count ({self.padded_num_heads}) must be divisible "
+                 f"by num_heads ({num_heads}) for head repeat"
+@@ -206,9 +219,12 @@ class MLAAttention(nn.Module):
+             )
+ 
+     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
+-    def _v_up_proj_and_o_proj(self, x):
+-        # Convert from (B, N, L) to (N, B, L)
+-        x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
++    def _v_up_proj_and_o_proj(self, x, heads_first=False):
++        # x is either (B, N*L) / (B, N, L) [heads_first=False]
++        # or (N, B, L) contiguous [heads_first=True]
++        if not heads_first:
++            # Convert from (B, N, L) to (N, B, L)
++            x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
+         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
+         # x = torch.bmm(x, self.W_UV).transpose(0, 1)
+         # Convert from (B, N, L) to (N, B, L)
+@@ -522,6 +538,83 @@ class MLAAttention(nn.Module):
+ 
+         return self._v_up_proj_and_o_proj(o)
+ 
++    def _forward_decode_triton(
++        self,
++        q: torch.Tensor,
++        kv_c_and_k_pe_cache: torch.Tensor,
++        attn_metadata: AttentionMetaData,
++    ) -> torch.Tensor:
++        """Triton MLA decode path for sub-16 head counts (e.g. TP8 with 8 heads).
++
++        Uses the Triton MLA kernel which handles arbitrary head counts natively,
++        avoiding head padding, q.repeat (float8_copy), and wasted compute on
++        duplicate heads. Q must be bf16 (not fp8) for this path.
++        """
++        B = q.shape[0]
++        num_kv_splits = 16
++
++        # q is bf16 (B, num_heads, kv_lora_rank + qk_rope_head_dim)
++        # KV cache: (total_tokens, kv_lora_rank + qk_rope_head_dim) — page_size=1
++        # Reshape to (total_tokens, 1, dim) for the Triton kernel (1 KV head)
++        dim = self.kv_lora_rank + self.qk_rope_head_dim
++        k_buffer = kv_c_and_k_pe_cache.view(-1, 1, dim)
++        # V is just the kv_lora_rank portion — same storage, narrowed view.
++        # Not contiguous (stride[0]=576 != 512) but the Triton kernel only
++        # accesses offs_c < kv_lora_rank via stride_buf_vbs, so this is fine.
++        v_buffer = kv_c_and_k_pe_cache.view(-1, 1, dim)[:, :, : self.kv_lora_rank]
++
++        paged_kv_indptr = attn_metadata.kv_indptr
++        paged_kv_indices = attn_metadata.kv_indices
++        if self.topk_indices_buffer is not None:
++            paged_kv_indptr = attn_metadata.sparse_kv_indptr
++            paged_kv_indices = triton_convert_req_index_to_global_index(
++                attn_metadata.cu_seqlens_q,
++                attn_metadata.kv_indptr,
++                paged_kv_indptr,
++                attn_metadata.kv_indices,
++                self.topk_indices_buffer[:B],
++                NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
++            )
++
++        # Output: (B, num_heads, kv_lora_rank) — native head count, no padding
++        o = torch.empty(
++            B, self.num_heads, self.kv_lora_rank,
++            dtype=q.dtype, device=q.device,
++        )
++
++        # Intermediate attention logits buffer
++        # Shape: (B, num_heads, num_kv_splits, kv_lora_rank + 1)
++        attn_logits = torch.empty(
++            B, self.num_heads, num_kv_splits, self.kv_lora_rank + 1,
++            dtype=torch.float32, device=q.device,
++        )
++
++        # k_pe_tokens not needed (RoPE already applied in KV cache)
++        k_pe_tokens = torch.empty(0, device=q.device)
++
++        decode_attention_fwd_grouped_rope(
++            q,
++            k_buffer,
++            v_buffer,
++            o,
++            paged_kv_indptr,
++            paged_kv_indices,
++            k_pe_tokens,
++            kv_lora_rank=self.kv_lora_rank,
++            rotary_dim=0,
++            cos_sin_cache=None,
++            positions=None,
++            attn_logits=attn_logits,
++            num_kv_splits=num_kv_splits,
++            sm_scale=self.scale,
++            logit_cap=0.0,
++            use_rope=False,
++            is_neox_style=False,
++        )
++
++        # Output is (B, num_heads, kv_lora_rank) — standard layout, no permute needed
++        return self._v_up_proj_and_o_proj(o)
++
+     def _forward_decode(
+         self,
+         q: torch.Tensor,
+@@ -530,18 +623,55 @@ class MLAAttention(nn.Module):
+     ) -> torch.Tensor:
+         assert kv_c_and_k_pe_cache.numel() > 0
+         assert attn_metadata is not None
++
++        if self.use_triton_mla_decode:
++            # Triton MLA wins for small-to-medium batch (no head padding overhead).
++            # ASM wins at high batch (64+ with long seq, 128+) where kernel
++            # compute dominates and Triton's launch overhead grows.
++            # Benchmarked on MI355X (non-persistent mode):
++            #   bs≤32: Triton always wins (+0.43 to +1.36ms/step)
++            #   bs=64,seq≤256: Triton wins (+1.56ms)
++            #   bs=64,seq≥1024: ASM wins (-4.93ms)
++            #   bs=128: ASM always wins (-2.56 to -10.57ms)
++            B = q.shape[0]
++            if B <= 32:
++                return self._forward_decode_triton(q, kv_c_and_k_pe_cache, attn_metadata)
++            # Fallback to ASM for large batch — need fp8 Q for ASM kernel
++            if q.dtype != dtypes.fp8:
++                q = q.to(dtypes.fp8)
++
+         B = q.shape[0]
+ 
+         if self.head_repeat_factor > 1:
+-            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
+-
+-        o = torch.empty(
+-            B,
+-            self.padded_num_heads,
+-            self.kv_lora_rank,
+-            dtype=self.dtype,
+-            device=q.device,
+-        )
++            # Use repeat (tile) instead of repeat_interleave so that the first
++            # num_heads output slots contain unique heads: [h0,h1,...,h7,h0,...,h7]
++            # This lets us slice o_heads_first[:num_heads] for contiguous output.
++            q = q.repeat(1, self.head_repeat_factor, 1)
++
++        # Allocate output in heads-first layout: (padded_N, B, L) contiguous.
++        # The kernel sees it as (B, padded_N, L) via permute (stride trick).
++        # After decode, o_heads_first[:num_heads] gives (num_heads, B, L)
++        # contiguous — no copy needed for head_repeat slicing or BMM transpose.
++        use_heads_first = self.head_repeat_factor > 1
++        if use_heads_first:
++            o_heads_first = torch.empty(
++                self.padded_num_heads,
++                B,
++                self.kv_lora_rank,
++                dtype=self.dtype,
++                device=q.device,
++            )
++            # Kernel expects (B, N, L) shape — permute gives that view
++            # with strides (L, B*L, 1) so kernel writes in heads-first order
++            o = o_heads_first.permute(1, 0, 2)
++        else:
++            o = torch.empty(
++                B,
++                self.padded_num_heads,
++                self.kv_lora_rank,
++                dtype=self.dtype,
++                device=q.device,
++            )
+ 
+         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
+         paged_kv_indptr = attn_metadata.kv_indptr
+@@ -602,6 +732,13 @@ class MLAAttention(nn.Module):
+             kv_scale=self._k_scale,
+         )
+ 
++        if use_heads_first:
++            # Slice real heads from heads-first storage — contiguous, no copy!
++            # o_heads_first[:num_heads] is (num_heads, B, L) contiguous
++            return self._v_up_proj_and_o_proj(
++                o_heads_first[: self.num_heads], heads_first=True
++            )
++
+         if self.head_repeat_factor > 1:
+             o = o[:, :: self.head_repeat_factor, :].contiguous()
+ 
+@@ -656,13 +793,21 @@ class MLAAttention(nn.Module):
+         else:
+             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
+ 
++            # Triton MLA decode needs bf16 Q (no fp8 support in Triton attention).
++            # ASM path uses fp8 Q (dtype_q = dtype_kv). The fused_qk_rope kernel
++            # supports both output dtypes — it checks q_out.scalar_type().
++            decode_q_dtype = (
++                self.dtype
++                if (self.use_triton_mla_decode and not context.is_prefill)
++                else attn_metadata.dtype_q
++            )
+             q_out = torch.empty(
+                 (
+                     q_nope.shape[0],
+                     self.num_heads,
+                     self.kv_lora_rank + self.qk_rope_head_dim,
+                 ),
+-                dtype=attn_metadata.dtype_q,
++                dtype=decode_q_dtype,
+                 device=q_nope.device,
+             )
+             if kv_cache.numel() > 0:
+diff --git a/atom/models/deepseek_v2.py b/atom/models/deepseek_v2.py
+index d1da9f0..f4d36a4 100644
+--- a/atom/models/deepseek_v2.py
++++ b/atom/models/deepseek_v2.py
+@@ -48,6 +48,7 @@ from aiter.ops.triton.fused_fp8_quant import (
+ from aiter.ops.triton.fused_mxfp4_quant import (
+     fused_reduce_rms_mxfp4_quant,
+     fused_rms_mxfp4_quant,
++    mxfp4_quant_shuffled,
+ )
+ from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+ from aiter.rotary_embedding import get_rope
+@@ -817,6 +818,21 @@ class DeepseekV2MoE(nn.Module):
+                     prefix=f"{prefix}.shared_experts",
+                 )
+ 
++    def process_weights_after_loading(self):
++        # Convert correction_bias to bf16 to match gate output dtype and avoid
++        # per-step bfloat16_copy kernels in the grouped_topk gate kernel.
++        # The AITER biased_grouped_topk_hip kernel requires
++        # gating_output.dtype == correction_bias.dtype.
++        # Gate output is bf16 (ReplicatedLinear with otype=bf16).
++        bias = getattr(self.gate, "e_score_correction_bias", None)
++        if bias is not None and bias.dtype != torch.bfloat16:
++            self.gate.e_score_correction_bias = nn.Parameter(
++                bias.data.to(torch.bfloat16), requires_grad=False
++            )
++            self.experts.e_score_correction_bias = (
++                self.gate.e_score_correction_bias
++            )
++
+     def _forward_dual_stream(
+         self,
+         hidden_states: torch.Tensor,
+@@ -1579,12 +1595,13 @@ class DeepseekV2DecoderLayer(nn.Module):
+                 self.quant_dtype == dtypes.fp8 or self.quant_dtype == dtypes.fp4x2
+             ) and use_triton_gemm():
+                 self.fuse_input_norm_quant = True
+-                if self.fuse_ar_input_norm:
+-                    self.fuse_ar_input_norm = False
+-                    if layer_idx == 0:
+-                        logger.info(
+-                            "Warning: Because ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on, AR + RMS fusion is turned off for input_layernorm and reduce_results is re-enabled for first k dense layer down_proj"
+-                        )
++                # NOTE: fuse_ar_input_norm is kept True when quant fusion is enabled.
++                # The forward path handles both: AR+RMSNorm (HIP) then quant-only (Triton).
++                if self.fuse_ar_input_norm and layer_idx == 0:
++                    logger.info(
++                        "Info: AR+RMSNorm fusion and quant fusion both enabled for input_layernorm. "
++                        "MoE/MLP AllReduce deferred into input_layernorm."
++                    )
+             else:
+                 if layer_idx == 0:
+                     logger.info(
+@@ -1635,7 +1652,21 @@ class DeepseekV2DecoderLayer(nn.Module):
+         residual: Optional[torch.Tensor],
+     ) -> torch.Tensor:
+         # Self Attention
+-        if self.fuse_input_norm_quant:
++        if (
++            self.fuse_input_norm_quant
++            and self.input_layernorm.fused_allreduce
++            and self.quant_dtype == dtypes.fp4x2
++            and residual is not None
++        ):
++            # AR + RMSNorm (HIP fused kernel) then MXFP4 quant-only (Triton)
++            # This path is used when MoE defers its AllReduce into input_layernorm.
++            hidden_states, residual = self.input_layernorm(hidden_states, residual)
++            hidden_states_quant, hidden_states_quant_scale = mxfp4_quant_shuffled(
++                hidden_states, shuffle=True, scale_shuffle_padding=True,
++            )
++            hidden_states = (hidden_states_quant, hidden_states_quant_scale)
++
++        elif self.fuse_input_norm_quant:
+             assert self.quant_dtype is not None
+             weight = self.input_layernorm.weight
+             eps = self.input_layernorm.eps
+-- 
+2.43.0
+
+
+From ed330fe16245529afe65c22e86a7f99d27734ea8 Mon Sep 17 00:00:00 2001
+From: Ian <ian@wafer.ai>
+Date: Wed, 18 Mar 2026 07:02:50 +0000
+Subject: [PATCH 2/2] fix: decide Q dtype at allocation time based on batch
+ size
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Avoids redundant bf16→fp8 cast when Triton decode falls through to ASM
+path for large batches. The batch size is known at q_out allocation time
+(q_nope.shape[0]), so we can pick the correct dtype up front.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ atom/model_ops/attention_mla.py | 16 +++++++++-------
+ 1 file changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/atom/model_ops/attention_mla.py b/atom/model_ops/attention_mla.py
+index 055c5f0..e308fb2 100644
+--- a/atom/model_ops/attention_mla.py
++++ b/atom/model_ops/attention_mla.py
+@@ -636,9 +636,7 @@ class MLAAttention(nn.Module):
+             B = q.shape[0]
+             if B <= 32:
+                 return self._forward_decode_triton(q, kv_c_and_k_pe_cache, attn_metadata)
+-            # Fallback to ASM for large batch — need fp8 Q for ASM kernel
+-            if q.dtype != dtypes.fp8:
+-                q = q.to(dtypes.fp8)
++            # Fallback to ASM — q is already fp8 (dtype decided at allocation)
+ 
+         B = q.shape[0]
+ 
+@@ -796,11 +794,15 @@ class MLAAttention(nn.Module):
+             # Triton MLA decode needs bf16 Q (no fp8 support in Triton attention).
+             # ASM path uses fp8 Q (dtype_q = dtype_kv). The fused_qk_rope kernel
+             # supports both output dtypes — it checks q_out.scalar_type().
+-            decode_q_dtype = (
+-                self.dtype
+-                if (self.use_triton_mla_decode and not context.is_prefill)
+-                else attn_metadata.dtype_q
++            # Use batch size to decide dtype up front — avoids redundant bf16→fp8
++            # cast in _forward_decode when falling through to ASM path.
++            B = q_nope.shape[0]
++            use_triton_this_step = (
++                self.use_triton_mla_decode
++                and not context.is_prefill
++                and B <= 32
+             )
++            decode_q_dtype = self.dtype if use_triton_this_step else attn_metadata.dtype_q
+             q_out = torch.empty(
+                 (
+                     q_nope.shape[0],
+-- 
+2.43.0
+

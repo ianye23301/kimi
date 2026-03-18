@@ -1,0 +1,132 @@
+From c618d20a19566382832c1e899926b3454dc7783f Mon Sep 17 00:00:00 2001
+From: Ian <ian@wafer.ai>
+Date: Wed, 18 Mar 2026 07:02:59 +0000
+Subject: [PATCH] feat: add SKIP_RMSNORM to fused_mxfp4_quant +
+ mxfp4_quant_shuffled wrapper
+
+Adds a SKIP_RMSNORM constexpr to the fused RMSNorm+MXFP4 quant Triton
+kernel, allowing it to be used for quant-only (no normalization). This
+enables the 2-kernel AR fusion path: HIP AR+RMSNorm followed by Triton
+quant-only, replacing the 3-kernel path (standalone AR, fused norm+quant).
+
+Also adds mxfp4_quant_shuffled() convenience wrapper and exports it.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ .../quant/fused_mxfp4_quant.py                | 18 ++++++-----
+ aiter/ops/triton/quant/__init__.py            |  2 ++
+ aiter/ops/triton/quant/fused_mxfp4_quant.py   | 30 +++++++++++++++++++
+ 3 files changed, 43 insertions(+), 7 deletions(-)
+
+diff --git a/aiter/ops/triton/_triton_kernels/quant/fused_mxfp4_quant.py b/aiter/ops/triton/_triton_kernels/quant/fused_mxfp4_quant.py
+index ef0510628..0f9b70810 100644
+--- a/aiter/ops/triton/_triton_kernels/quant/fused_mxfp4_quant.py
++++ b/aiter/ops/triton/_triton_kernels/quant/fused_mxfp4_quant.py
+@@ -62,6 +62,7 @@ def _fused_rms_mxfp4_quant_kernel(
+     SHUFFLE_PAD: tl.constexpr,
+     EVEN_M_N: tl.constexpr,
+     EVEN_M_N2: tl.constexpr,
++    SKIP_RMSNORM: tl.constexpr = False,
+ ):
+     # TODO: XCD remapping where every 32-token block should share the same XCD
+     # TODO: debug for large M
+@@ -133,15 +134,18 @@ def _fused_rms_mxfp4_quant_kernel(
+         ).to(tl.float32)
+         x1 = x1 + res1
+ 
+-    w_mask1 = None
+-    w_other1 = None
+-    if not EVEN_M_N:
+-        w_mask1 = x_offs_n < N1
+-        w_other1 = 0.0
++    if SKIP_RMSNORM:
++        norm1 = x1
++    else:
++        w_mask1 = None
++        w_other1 = None
++        if not EVEN_M_N:
++            w_mask1 = x_offs_n < N1
++            w_other1 = 0.0
+ 
+-    w1 = tl.load(w1_ptr + x_offs_n, mask=w_mask1, other=w_other1).to(tl.float32)
++        w1 = tl.load(w1_ptr + x_offs_n, mask=w_mask1, other=w_other1).to(tl.float32)
+ 
+-    norm1 = _rmsmorm_op(x1, w1, N1, eps1)
++        norm1 = _rmsmorm_op(x1, w1, N1, eps1)
+ 
+     if FIRST_INPUT_OUT:
+         tl.store(
+diff --git a/aiter/ops/triton/quant/__init__.py b/aiter/ops/triton/quant/__init__.py
+index 144a0247d..1001088f6 100644
+--- a/aiter/ops/triton/quant/__init__.py
++++ b/aiter/ops/triton/quant/__init__.py
+@@ -20,6 +20,7 @@ from .fused_mxfp4_quant import (
+     fused_reduce_act_mul_and_mxfp4_quant,
+     fused_reduce_rms_mxfp4_quant,
+     fused_dynamic_mxfp4_quant_moe_sort,
++    mxfp4_quant_shuffled,
+ )
+ 
+ __all__ = [
+@@ -41,4 +42,5 @@ __all__ = [
+     "fused_reduce_act_mul_and_mxfp4_quant",
+     "fused_reduce_rms_mxfp4_quant",
+     "fused_dynamic_mxfp4_quant_moe_sort",
++    "mxfp4_quant_shuffled",
+ ]
+diff --git a/aiter/ops/triton/quant/fused_mxfp4_quant.py b/aiter/ops/triton/quant/fused_mxfp4_quant.py
+index 1b02e7c7d..1a9736c76 100644
+--- a/aiter/ops/triton/quant/fused_mxfp4_quant.py
++++ b/aiter/ops/triton/quant/fused_mxfp4_quant.py
+@@ -30,6 +30,7 @@ def fused_rms_mxfp4_quant(
+     shuffle: Optional[bool] = False,
+     scale_shuffle_padding: Optional[bool] = False,
+     output_unquantized_inp1=False,
++    skip_rmsnorm: bool = False,
+ ):
+     """
+     This op contains several steps:
+@@ -141,11 +142,40 @@ def fused_rms_mxfp4_quant(
+         SCALE_N_PAD=SCALE_N,
+         SHUFFLE=shuffle,
+         SHUFFLE_PAD=use_scale_shuffle_padding,
++        SKIP_RMSNORM=skip_rmsnorm,
+     )
+ 
+     return (out1_fp4, out1_bs), out1, out2, out_res1
+ 
+ 
++def mxfp4_quant_shuffled(
++    x: torch.Tensor,
++    shuffle: bool = True,
++    scale_shuffle_padding: bool = True,
++):
++    """MXFP4 quantization with CK shuffle layout, no RMSNorm applied.
++
++    Args:
++        x: 2D tensor [M, N] in bf16/fp16
++        shuffle: apply CK-compatible scale shuffle
++        scale_shuffle_padding: pad scale dimensions for CK alignment
++
++    Returns:
++        (x_fp4, x_scale): quantized data and e8m0 block scales
++    """
++    # Pass x[0] as dummy weight ptr (never accessed when skip_rmsnorm=True).
++    # Avoids tensor allocation which would break CUDAGraph capture.
++    (x_fp4, x_scale), _, _, _ = fused_rms_mxfp4_quant(
++        x1=x,
++        x1_weight=x[0],
++        x1_epsilon=0.0,
++        shuffle=shuffle,
++        scale_shuffle_padding=scale_shuffle_padding,
++        skip_rmsnorm=True,
++    )
++    return x_fp4, x_scale
++
++
+ def fused_flatten_mxfp4_quant(
+     x: torch.Tensor,
+ ):
+-- 
+2.43.0
+
